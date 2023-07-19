@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"encoding/csv"
-	"flag"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -14,18 +14,325 @@ import (
 	"golang.org/x/oauth2"
 )
 
-const (
-	version              = "1.0"
-	pr_high              = 500
-	pr_low               = 50
-	contributor_cooldown = 1 // month
-)
+const version = "1.0"
 
-var (
-	org   string
-	repo  string
-	token string
-)
+type Settings struct {
+	Contributors struct {
+		Cooldown  int      `json:"cooldown"`
+		Allowlist []string `json:"allowlist"`
+	} `json:"contributors"`
+	PR struct {
+		High int `json:"high"`
+		Low  int `json:"low"`
+	} `json:"pr"`
+	Graphs struct {
+		Start *string `json:"start"`
+	} `json:"graphs"`
+}
+
+type Config struct {
+	Settings Settings `json:"settings"`
+	Repos    []string `json:"repos"`
+}
+
+func main() {
+	fmt.Printf("reposcan v%s\n", version)
+
+	fmt.Printf("loading token...\n")
+
+	data, err := os.ReadFile(".token")
+	if err != nil {
+		fmt.Println("Error opening token file:", err)
+		return
+	}
+	token := strings.Trim(string(data), "\n\r")
+
+	fmt.Printf("loading config...\n")
+
+	jsonData, err := os.ReadFile("config.json")
+	if err != nil {
+		fmt.Println("Error reading file:", err)
+		return
+	}
+
+	var config Config
+	err = json.Unmarshal(jsonData, &config)
+	if err != nil {
+		fmt.Println("Error unmarshaling JSON data:", err)
+		return
+	}
+
+	fmt.Println("authenticating...")
+
+	ctx := context.Background()
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+	tc := oauth2.NewClient(ctx, ts)
+	client := githubv4.NewClient(tc)
+
+	repos := make(map[string]*Repo)
+	users := make(map[string]User)
+
+	startGraphs := time.Now().UTC()
+
+	// Load PRs from repos
+	for _, k := range config.Repos {
+		org, repo, err := orgRepoSplit(k)
+		if err != nil {
+			fmt.Println("Invalid repo:", err)
+			return
+		}
+
+		// Get all PRs for this repo
+		start, prs, err := repoPulls(ctx, client, org, repo)
+		if err != nil {
+			fmt.Println("Error reading PRs:", err)
+			return
+		}
+
+		// No pulse data yet we first need to figure out the
+		// earliest start date to align all graphs
+		repos[k] = &Repo{
+			prs: prs,
+		}
+
+		if startGraphs.After(start) {
+			// Capture the earliest repo creation time
+			startGraphs = start
+		}
+	}
+
+	// Override for start
+	if config.Settings.Graphs.Start != nil {
+		startGraphs, err = time.Parse("2006-01-02", *config.Settings.Graphs.Start)
+		if err != nil {
+			fmt.Println("Error parsing starting time:", err)
+			return
+		}
+	}
+
+	// Generate pulse data
+	for _, k := range config.Repos {
+		org, repo, err := orgRepoSplit(k)
+		if err != nil {
+			fmt.Println("Invalid repo:", err)
+			return
+		}
+		fmt.Printf("%s/%s: generating pulse metrics...\n", org, repo)
+
+		endTime := time.Now().AddDate(0, 0, 1)
+		repoUsers := getUsers(config, repos[k].prs)
+		pulses := getPulses(config, startGraphs, endTime, repos[k].prs, repoUsers)
+
+		// Merge with global user list (we will export this for help building allowlists)
+		for k, v := range repoUsers {
+			users[k] = v
+		}
+
+		repos[k].pulses = pulses
+		repos[k].start = startGraphs
+
+		fmt.Printf("%s/%s: generating pr graph...\n", org, repo)
+
+		err = genPRGraph(org, repo, repos[k].pulses)
+		if err != nil {
+			fmt.Println("Error writing PR graph:", err)
+			return
+		}
+
+		fmt.Printf("%s/%s: generating normalised graph...\n", org, repo)
+
+		err = genNormGraph(org, repo, repos[k].pulses)
+		if err != nil {
+			fmt.Println("Error writing normalised graph:", err)
+			return
+		}
+	}
+
+	err = genCompareNormGraphs(config, repos)
+	if err != nil {
+		fmt.Println("Error writing normalised comparison graphs:", err)
+		return
+	}
+
+	fmt.Printf("generating user list...\n")
+	err = genUsers(users)
+	if err != nil {
+		fmt.Println("Error writing users to file:", err)
+		return
+	}
+
+	fmt.Println("done.")
+}
+
+func genCompareNormGraphs(config Config, repos map[string]*Repo) error {
+	graphs := []struct {
+		name string
+		desc string
+	}{
+		{
+			name: "velocity",
+			desc: "velocity (norm)",
+		},
+		{
+			name: "open",
+			desc: "open (norm)",
+		},
+		{
+			name: "churn",
+			desc: "churn (norm)",
+		},
+		{
+			name: "merged",
+			desc: "merged (norm)",
+		},
+	}
+
+	for _, t := range graphs {
+
+		fmt.Printf("%s: generating normalised comparison graph...\n", t.desc)
+
+		name := fmt.Sprintf("compare-%s.csv", t.name)
+		f, err := os.Create(name)
+		if err != nil {
+			return fmt.Errorf("cannot create graph file: %w", err)
+		}
+
+		w := csv.NewWriter(f)
+		w.Write([]string{fmt.Sprintf("Compare: %s", t.desc)})
+
+		for i, k := range config.Repos {
+			if i == 0 {
+				// The first iteration needs to plot the dates
+				line := make([]string, 0)
+				line = append(line, "Pulse")
+				for _, v := range repos[k].pulses {
+					line = append(line, v.Start.Format("2006-01-02"))
+				}
+				w.Write(line)
+			}
+
+			line := make([]string, 0)
+			line = append(line, k)
+			for _, v := range repos[k].pulses {
+				line = append(line, func(t string, p Pulse) string {
+					switch t {
+					case "velocity":
+						return fmt.Sprintf("%0.2f", p.PrVelocityNorm)
+					case "open":
+						return fmt.Sprintf("%0.2f", p.PrOpenNorm)
+					case "churn":
+						return fmt.Sprintf("%0.2f", p.PrChurnNorm)
+					case "merged":
+						return fmt.Sprintf("%0.2f", p.PrMergedNorm)
+					default:
+						panic("not a valid metric type")
+					}
+				}(t.name, v))
+			}
+			w.Write(line)
+		}
+
+		w.Flush()
+		f.Sync()
+		f.Close()
+	}
+	return nil
+}
+
+func genPRGraph(org string, repo string, pulses []Pulse) error {
+
+	name := fmt.Sprintf("%s-%s-abs.csv", org, repo)
+	f, err := os.Create(name)
+	if err != nil {
+		return fmt.Errorf("cannot create graph file: %w", err)
+	}
+
+	w := csv.NewWriter(f)
+	w.Write([]string{fmt.Sprintf("Repo: %s/%s", org, repo)})
+	w.Write([]string{
+		"Pulse",
+		"Contributors",
+		"Open",
+		"Churn",
+		"Merged",
+		"Velocity",
+	})
+	for _, p := range pulses {
+
+		s := p.Start.Format("2006-01-02")
+		w.Write([]string{
+			s,
+			fmt.Sprintf("%d", p.Contributors),
+			fmt.Sprintf("%0.2f", p.PrOpen),
+			fmt.Sprintf("%0.2f", -p.PrChurn),
+			fmt.Sprintf("%0.2f", p.PrMerged),
+			fmt.Sprintf("%0.2f", p.PrVelocity),
+		})
+	}
+	w.Flush()
+	f.Sync()
+	f.Close()
+	return nil
+}
+
+func genNormGraph(org string, repo string, pulses []Pulse) error {
+
+	name := fmt.Sprintf("%s-%s-norm.csv", org, repo)
+	f, err := os.Create(name)
+	if err != nil {
+		return fmt.Errorf("cannot create graph file: %w", err)
+	}
+
+	w := csv.NewWriter(f)
+	w.Write([]string{fmt.Sprintf("Repo: %s/%s", org, repo)})
+	w.Write([]string{
+		"Pulse",
+		"Open (Norm)",
+		"Churn (Norm)",
+		"Merged (Norm)",
+		"Velocity (Norm)",
+	})
+	for _, p := range pulses {
+
+		s := p.Start.Format("2006-01-02")
+		w.Write([]string{
+			s,
+			fmt.Sprintf("%0.2f", p.PrOpenNorm),
+			fmt.Sprintf("%0.2f", -p.PrChurnNorm),
+			fmt.Sprintf("%0.2f", p.PrMergedNorm),
+			fmt.Sprintf("%0.2f", p.PrVelocityNorm),
+		})
+	}
+	w.Flush()
+	f.Sync()
+	f.Close()
+	return nil
+}
+
+func genUsers(users map[string]User) error {
+
+	name := fmt.Sprintf("all-users.csv")
+	f, err := os.Create(name)
+	if err != nil {
+		return fmt.Errorf("cannot create user list file: %w", err)
+	}
+
+	w := csv.NewWriter(f)
+	w.Write([]string{"Login"})
+	for k, _ := range users {
+		w.Write([]string{k})
+	}
+	w.Flush()
+	f.Sync()
+	f.Close()
+	return nil
+}
+
+type Repo struct {
+	start  time.Time
+	prs    []PrEntry
+	pulses []Pulse
+}
 
 type PrEntry struct {
 	Additions int
@@ -53,121 +360,47 @@ type RepoEntry struct {
 	} `graphql:"repository(owner: $owner, name: $name)"`
 }
 
-func main() {
-	// Load the token if available
-	data, _ := os.ReadFile(".token")
-	token = strings.Trim(string(data), "\n\r")
-
-	flag.StringVar(&org, "org", "canonical", "github organisation")
-	flag.StringVar(&repo, "repo", "pebble", "github repository")
-	flag.StringVar(&token, "token", token, "github personal access token")
-	flag.Parse()
-
-	fmt.Printf("reposcan v%s\n", version)
-	fmt.Println()
-	fmt.Printf("org: %s\n", org)
-	fmt.Printf("repo: %s\n", repo)
-	fmt.Printf("token: %s\n", token)
-	fmt.Println()
-
-	fmt.Println("authenticating...")
-	ctx := context.Background()
-	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
-	tc := oauth2.NewClient(ctx, ts)
-	client := githubv4.NewClient(tc)
-
-	fmt.Print("requesting pull request history...")
+func repoPulls(ctx context.Context, client *githubv4.Client, org string, repo string) (start time.Time, prs []PrEntry, err error) {
 	var q RepoEntry
-	var prs []PrEntry
+
 	variables := map[string]interface{}{
 		"owner":       githubv4.String(org),
 		"name":        githubv4.String(repo),
 		"nodesCursor": (*githubv4.String)(nil),
 	}
 	done := 0
+	total := 0
 	for {
 		err := client.Query(ctx, &q, variables)
 		if err != nil {
-			fmt.Printf("repo requests failed: %v\n", err)
-			return
+			return start, prs, fmt.Errorf("repo requests failed: %w\n", err)
 		}
+
 		prs = append(prs, q.Repository.PullRequests.Nodes...)
+
+		done += 100
+		total = q.Repository.PullRequests.TotalCount
+		if done < total {
+			fmt.Printf("\r%s/%s: reading pr history (%d/%d)...", org, repo, done, total)
+		}
+
 		if !q.Repository.PullRequests.PageInfo.HasNextPage {
 			break
 		}
 		variables["nodesCursor"] = githubv4.NewString(q.Repository.PullRequests.PageInfo.EndCursor)
-		done += 100
-		fmt.Printf("\rrequesting pull request history... [%d/%d]", done, q.Repository.PullRequests.TotalCount)
 	}
 
-	startTime := q.Repository.CreatedAt
-	endTime := time.Now().AddDate(0, 0, 1)
-	pulses := getPulses(startTime, endTime, prs)
-	fmt.Println("")
+	fmt.Printf("\r%s/%s: reading pr history (%d/%d)...\n", org, repo, total, total)
 
-	fmt.Println("generating absolute graph...")
-	// Normal CSV
-	name := fmt.Sprintf("%s-%s-abs.csv", org, repo)
-	f, err := os.Create(name)
-	if err != nil {
-		panic("cannot create file")
+	return q.Repository.CreatedAt, prs, nil
+}
+
+func orgRepoSplit(key string) (org string, repo string, err error) {
+	elements := strings.Split(key, "/")
+	if len(elements) == 2 {
+		return elements[0], elements[1], nil
 	}
-
-	w := csv.NewWriter(f)
-	w.Write([]string{
-		"Pulse",
-		"Contributors",
-		"Open",
-		"Churn",
-		"Merged",
-		"Velocity",
-	})
-	for _, p := range pulses {
-
-		s := p.Start.Format("2006-01-02")
-		w.Write([]string{
-			s,
-			fmt.Sprintf("%d", p.Contributors),
-			fmt.Sprintf("%0.2f", p.PrOpen),
-			fmt.Sprintf("%0.2f", -p.PrChurn),
-			fmt.Sprintf("%0.2f", p.PrMerged),
-			fmt.Sprintf("%0.2f", p.PrVelocity),
-		})
-	}
-	w.Flush()
-	f.Sync()
-	f.Close()
-
-	fmt.Println("generating team/pr size normalised graph...")
-	// Normalised CSV
-	name = fmt.Sprintf("%s-%s-norm.csv", org, repo)
-	f, err = os.Create(name)
-	if err != nil {
-		panic("cannot create file")
-	}
-
-	w = csv.NewWriter(f)
-	w.Write([]string{
-		"Pulse",
-		"Open (Norm)",
-		"Churn (Norm)",
-		"Merged (Norm)",
-		"Velocity (Norm)",
-	})
-	for _, p := range pulses {
-
-		s := p.Start.Format("2006-01-02")
-		w.Write([]string{
-			s,
-			fmt.Sprintf("%0.2f", p.PrOpenNorm),
-			fmt.Sprintf("%0.2f", -p.PrChurnNorm),
-			fmt.Sprintf("%0.2f", p.PrMergedNorm),
-			fmt.Sprintf("%0.2f", p.PrVelocityNorm),
-		})
-	}
-	w.Flush()
-	f.Sync()
-	f.Close()
+	return "", "", fmt.Errorf("repo JSON key invalid")
 }
 
 type User struct {
@@ -175,7 +408,7 @@ type User struct {
 	End   time.Time
 }
 
-func getUsers(pulls []PrEntry) map[string]User {
+func getUsers(config Config, pulls []PrEntry) map[string]User {
 	users := make(map[string]User)
 	for _, r := range pulls {
 		if r.Author.Login == "" {
@@ -208,8 +441,9 @@ func getUsers(pulls []PrEntry) map[string]User {
 		}
 
 		// Promote to current time if user contributed
-		// in the last 1 months
-		if time.Now().Sub(endTime) < (contributor_cooldown * 30 * 24 * time.Hour) {
+		// in the last x months
+		cooldown := config.Settings.Contributors.Cooldown * 30 * 24
+		if time.Now().Sub(endTime) < (time.Duration(cooldown) * time.Hour) {
 			endTime = time.Now().UTC()
 		}
 
@@ -221,8 +455,27 @@ func getUsers(pulls []PrEntry) map[string]User {
 	return users
 }
 
-func pulseContributors(users map[string]User, start time.Time, end time.Time) (contributors int) {
-	for _, v := range users {
+func allowlistedUser(config Config, login string) bool {
+	if len(config.Settings.Contributors.Allowlist) == 0 {
+		// Empty list means all users are tracked
+		return true
+	}
+
+	for _, u := range config.Settings.Contributors.Allowlist {
+		if u == login {
+			return true
+		}
+	}
+	return false
+}
+
+func pulseContributors(config Config, users map[string]User, start time.Time, end time.Time) (contributors int) {
+	for k, v := range users {
+		if allowlistedUser(config, k) == false {
+			// Ignore this user
+			continue
+		}
+
 		if v.Start.Before(end) == true && v.End.Before(start) == false {
 			contributors = contributors + 1
 		}
@@ -237,9 +490,14 @@ type Pull struct {
 	Lines  int
 }
 
-func pulsePulls(pulls []PrEntry, start time.Time, end time.Time) []Pull {
+func pulsePulls(config Config, pulls []PrEntry, start time.Time, end time.Time) []Pull {
 	pull := make([]Pull, 0)
 	for _, p := range pulls {
+		// Only pulls by allowlisted users are tracked
+		if allowlistedUser(config, p.Author.Login) == false {
+			continue
+		}
+
 		// All PRs that overlap with the window
 		if (p.ClosedAt == nil || p.ClosedAt.Before(start) == false) && p.CreatedAt.Before(end) == true {
 			// All PRs that closed within the window
@@ -269,76 +527,82 @@ func pulsePulls(pulls []PrEntry, start time.Time, end time.Time) []Pull {
 	return pull
 }
 
-func prSizeWeight(lines float32) float32 {
-	if lines > float32(pr_high) {
+func prSizeWeight(config Config, lines float32) float32 {
+	if lines > float32(config.Settings.PR.High) {
 		return 3.0
-	} else if lines > float32(pr_low) {
+	} else if lines > float32(config.Settings.PR.Low) {
 		return 2.0
 	}
 	return 1.0
 }
 
-func getOpen(pulls []Pull, norm bool, con int) float32 {
-	var open float32
+func getOpen(config Config, pulls []Pull) float32 {
 	var count float32
 	for _, p := range pulls {
 		if p.Open == true {
 			count += 1.0
-			open += float32(p.Lines)
 		}
 	}
-	// Average Lines
-	open = open / count
+	return count
+}
 
-	if norm == false {
-		return count
+func getOpenNorm(config Config, pulls []Pull, con int) float32 {
+	var count float32
+	for _, p := range pulls {
+		if p.Open == true {
+			count += prSizeWeight(config,float32(p.Lines))
+		}
 	}
 	if con == 0 {
 		return 0.0
 	}
-	return count * prSizeWeight(open) / float32(con)
+	return count / float32(con)
 }
 
-func getChurn(pulls []Pull, norm bool, con int) float32 {
-	var churn float32
+func getChurn(config Config, pulls []Pull) float32 {
 	var count float32
 	for _, p := range pulls {
 		if p.Closed == true {
 			count += 1.0
-			churn += float32(p.Lines)
 		}
 	}
-	// Average Lines
-	churn = churn / count
+	return count
+}
 
-	if norm == false {
-		return count
+func getChurnNorm(config Config, pulls []Pull, con int) float32 {
+	var count float32
+	for _, p := range pulls {
+		if p.Closed == true {
+			count += prSizeWeight(config,float32(p.Lines))
+		}
 	}
 	if con == 0 {
 		return 0.0
 	}
-	return count * prSizeWeight(churn) / float32(con)
+	return count / float32(con)
 }
 
-func getMerged(pulls []Pull, norm bool, con int) float32 {
-	var merged float32
+func getMerged(config Config, pulls []Pull) float32 {
 	var count float32
 	for _, p := range pulls {
 		if p.Merged == true {
 			count += 1.0
-			merged += float32(p.Lines)
 		}
 	}
-	// Average Lines
-	merged = merged / count
+	return count
+}
 
-	if norm == false {
-		return count
+func getMergedNorm(config Config, pulls []Pull, con int) float32 {
+	var count float32
+	for _, p := range pulls {
+		if p.Merged == true {
+			count += prSizeWeight(config, float32(p.Lines))
+		}
 	}
 	if con == 0 {
 		return 0.0
 	}
-	return count * prSizeWeight(merged) / float32(con)
+	return count / float32(con)
 }
 
 type Pulse struct {
@@ -357,7 +621,8 @@ type Pulse struct {
 }
 
 func isoWeeks(year int) (weeks int) {
-	_, weeks = time.Date(year, 12, 31, 0, 0, 0, 0, time.UTC).ISOWeek()
+	// Day 28 always on last ISO week of current year
+	_, weeks = time.Date(year, 12, 28, 0, 0, 0, 0, time.UTC).ISOWeek()
 	return weeks
 }
 
@@ -381,8 +646,7 @@ func nextPulseToIsoWeek(year int, week int) (int, int) {
 	return year, week
 }
 
-func getPulses(start time.Time, end time.Time, pulls []PrEntry) []Pulse {
-	users := getUsers(pulls)
+func getPulses(config Config, start time.Time, end time.Time, pulls []PrEntry, users map[string]User) []Pulse {
 	if end.Before(start) {
 		panic("end time cannot before start")
 	}
@@ -401,22 +665,22 @@ func getPulses(start time.Time, end time.Time, pulls []PrEntry) []Pulse {
 			break
 		}
 
-		people := pulseContributors(users, s, e)
-		pulsePulls := pulsePulls(pulls, s, e)
+		people := pulseContributors(config, users, s, e)
+		pulsePulls := pulsePulls(config, pulls, s, e)
 
 		pulses = append(pulses, Pulse{
 			Start:          s,
 			End:            e,
 			Days:           d,
 			Contributors:   people,
-			PrOpen:         getOpen(pulsePulls, false, 0),
-			PrChurn:        getChurn(pulsePulls, false, 0),
-			PrMerged:       getMerged(pulsePulls, false, 0),
-			PrVelocity:     (getMerged(pulsePulls, false, 0) - getChurn(pulsePulls, false, 0)),
-			PrOpenNorm:     getOpen(pulsePulls, true, people),
-			PrChurnNorm:    getChurn(pulsePulls, true, people),
-			PrMergedNorm:   getMerged(pulsePulls, true, people),
-			PrVelocityNorm: (getMerged(pulsePulls, true, people) - getChurn(pulsePulls, true, people)),
+			PrOpen:         getOpen(config, pulsePulls),
+			PrChurn:        getChurn(config, pulsePulls),
+			PrMerged:       getMerged(config, pulsePulls),
+			PrVelocity:     (getMerged(config, pulsePulls) - getChurn(config, pulsePulls)),
+			PrOpenNorm:     getOpenNorm(config, pulsePulls, people),
+			PrChurnNorm:    getChurnNorm(config, pulsePulls, people),
+			PrMergedNorm:   getMergedNorm(config, pulsePulls, people),
+			PrVelocityNorm: (getMergedNorm(config, pulsePulls, people) - getChurnNorm(config, pulsePulls, people)),
 		})
 
 		yearStart = yearEnd

@@ -1,0 +1,23 @@
+{
+  "settings": {
+    "contributors": {
+      "cooldown": 1,
+      "allowlist": []
+    },
+    "pr": {
+      "high": 500,
+      "low": 50
+    },
+    "graphs": {
+      "start": "2021-01-01"
+    }
+
+  },
+  "repos": [
+    "snapcore/snapcraft",
+    "snapcore/spread",
+    "snapcore/snapd",
+    "canonical/chisel",
+    "canonical/pebble"
+  ]
+}
