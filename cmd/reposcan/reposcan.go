@@ -170,16 +170,8 @@ func genCompareNormGraphs(config Config, repos map[string]*Repo) error {
 		desc string
 	}{
 		{
-			name: "velocity",
-			desc: "velocity (norm)",
-		},
-		{
 			name: "open",
 			desc: "open (norm)",
-		},
-		{
-			name: "churn",
-			desc: "churn (norm)",
 		},
 		{
 			name: "merged",
@@ -216,12 +208,8 @@ func genCompareNormGraphs(config Config, repos map[string]*Repo) error {
 			for _, v := range repos[k].pulses {
 				line = append(line, func(t string, p Pulse) string {
 					switch t {
-					case "velocity":
-						return fmt.Sprintf("%0.2f", p.PrVelocityNorm)
 					case "open":
 						return fmt.Sprintf("%0.2f", p.PrOpenNorm)
-					case "churn":
-						return fmt.Sprintf("%0.2f", p.PrChurnNorm)
 					case "merged":
 						return fmt.Sprintf("%0.2f", p.PrMergedNorm)
 					default:
@@ -253,9 +241,7 @@ func genPRGraph(org string, repo string, pulses []Pulse) error {
 		"Pulse",
 		"Contributors",
 		"Open",
-		"Churn",
 		"Merged",
-		"Velocity",
 	})
 	for _, p := range pulses {
 
@@ -264,9 +250,7 @@ func genPRGraph(org string, repo string, pulses []Pulse) error {
 			s,
 			fmt.Sprintf("%d", p.Contributors),
 			fmt.Sprintf("%0.2f", p.PrOpen),
-			fmt.Sprintf("%0.2f", -p.PrChurn),
 			fmt.Sprintf("%0.2f", p.PrMerged),
-			fmt.Sprintf("%0.2f", p.PrVelocity),
 		})
 	}
 	w.Flush()
@@ -288,9 +272,7 @@ func genNormGraph(org string, repo string, pulses []Pulse) error {
 	w.Write([]string{
 		"Pulse",
 		"Open (Norm)",
-		"Churn (Norm)",
 		"Merged (Norm)",
-		"Velocity (Norm)",
 	})
 	for _, p := range pulses {
 
@@ -298,9 +280,7 @@ func genNormGraph(org string, repo string, pulses []Pulse) error {
 		w.Write([]string{
 			s,
 			fmt.Sprintf("%0.2f", p.PrOpenNorm),
-			fmt.Sprintf("%0.2f", -p.PrChurnNorm),
 			fmt.Sprintf("%0.2f", p.PrMergedNorm),
-			fmt.Sprintf("%0.2f", p.PrVelocityNorm),
 		})
 	}
 	w.Flush()
@@ -559,29 +539,6 @@ func getOpenNorm(config Config, pulls []Pull, con int) float32 {
 	return count / float32(con)
 }
 
-func getChurn(config Config, pulls []Pull) float32 {
-	var count float32
-	for _, p := range pulls {
-		if p.Closed == true {
-			count += 1.0
-		}
-	}
-	return count
-}
-
-func getChurnNorm(config Config, pulls []Pull, con int) float32 {
-	var count float32
-	for _, p := range pulls {
-		if p.Closed == true {
-			count += prSizeWeight(config,float32(p.Lines))
-		}
-	}
-	if con == 0 {
-		return 0.0
-	}
-	return count / float32(con)
-}
-
 func getMerged(config Config, pulls []Pull) float32 {
 	var count float32
 	for _, p := range pulls {
@@ -611,13 +568,9 @@ type Pulse struct {
 	Days           int
 	Contributors   int
 	PrOpen         float32
-	PrChurn        float32
 	PrMerged       float32
-	PrVelocity     float32
 	PrOpenNorm     float32
-	PrChurnNorm    float32
 	PrMergedNorm   float32
-	PrVelocityNorm float32
 }
 
 func isoWeeks(year int) (weeks int) {
@@ -674,13 +627,9 @@ func getPulses(config Config, start time.Time, end time.Time, pulls []PrEntry, u
 			Days:           d,
 			Contributors:   people,
 			PrOpen:         getOpen(config, pulsePulls),
-			PrChurn:        getChurn(config, pulsePulls),
 			PrMerged:       getMerged(config, pulsePulls),
-			PrVelocity:     (getMerged(config, pulsePulls) - getChurn(config, pulsePulls)),
 			PrOpenNorm:     getOpenNorm(config, pulsePulls, people),
-			PrChurnNorm:    getChurnNorm(config, pulsePulls, people),
 			PrMergedNorm:   getMergedNorm(config, pulsePulls, people),
-			PrVelocityNorm: (getMergedNorm(config, pulsePulls, people) - getChurnNorm(config, pulsePulls, people)),
 		})
 
 		yearStart = yearEnd
