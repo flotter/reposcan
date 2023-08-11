@@ -28,17 +28,9 @@ Data is currently by organised into 2-week pulses. This is based on ISO Weeks, a
 
 Number of open PRs as measured by the end of a pulse.
 
-### Metrics: Churn
-
-Number of open PRs closed without merging during a pulse.
-
 ### Metrics: Merged
 
 Number of open PRs merged during a pulse.
-
-### Metrics: Velocity
-
-Difference between Merged and Churn (merged - churn)
 
 ### Metrics: Normalisation
 
@@ -96,7 +88,11 @@ The behaviour of reposcan is controlled with a JSON config file:
       // be forced to start on the supplied data. Note that all
       // graphs always start on the same data, irrespective if data
       // is available or not.
-      "start": "2022-01-01"
+      "start": "2022-01-01",
+
+      // Render at most this number of pulses. If the value supplied
+      // is negative or zero, this restriction is disabled.
+      "window": 12
     }
 
   },

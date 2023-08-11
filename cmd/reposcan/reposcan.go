@@ -27,6 +27,7 @@ type Settings struct {
 	} `json:"pr"`
 	Graphs struct {
 		Start *string `json:"start"`
+		Window int `json:"window"`
 	} `json:"graphs"`
 }
 
@@ -635,5 +636,12 @@ func getPulses(config Config, start time.Time, end time.Time, pulls []PrEntry, u
 		yearStart = yearEnd
 		weekStart = weekEnd
 	}
+
+	// If the number of pulses required (Graph.Window) is less than what is available
+	// lets trim what we return.
+	if config.Settings.Graphs.Window > 0 {
+		pulses = pulses[len(pulses) - config.Settings.Graphs.Window:]
+	}
+
 	return pulses
 }
