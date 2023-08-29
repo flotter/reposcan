@@ -322,6 +322,7 @@ type PrEntry struct {
 	MergedAt  *time.Time
 	Deletions int
 	State     string
+	BaseRefName string
 	Author    struct {
 		Login string
 	}
@@ -329,6 +330,9 @@ type PrEntry struct {
 
 type RepoEntry struct {
 	Repository struct {
+		DefaultBranchRef struct {
+			Name string
+		}
 		CreatedAt    time.Time
 		PullRequests struct {
 			Nodes    []PrEntry
@@ -351,13 +355,14 @@ func repoPulls(ctx context.Context, client *githubv4.Client, org string, repo st
 	}
 	done := 0
 	total := 0
+	var prsUnfiltered []PrEntry
 	for {
 		err := client.Query(ctx, &q, variables)
 		if err != nil {
 			return start, prs, fmt.Errorf("repo requests failed: %w\n", err)
 		}
 
-		prs = append(prs, q.Repository.PullRequests.Nodes...)
+		prsUnfiltered = append(prsUnfiltered, q.Repository.PullRequests.Nodes...)
 
 		done += 100
 		total = q.Repository.PullRequests.TotalCount
@@ -372,6 +377,13 @@ func repoPulls(ctx context.Context, client *githubv4.Client, org string, repo st
 	}
 
 	fmt.Printf("\r%s/%s: reading pr history (%d/%d)...\n", org, repo, total, total)
+
+	for _, v := range prsUnfiltered {
+		if v.BaseRefName == q.Repository.DefaultBranchRef.Name {
+			prs = append(prs, v)
+		}
+	}
+	fmt.Printf("\r%s/%s: %d prs against branch %s...\n", org, repo, len(prs), q.Repository.DefaultBranchRef.Name)
 
 	return q.Repository.CreatedAt, prs, nil
 }
